@@ -24,6 +24,7 @@ pub extern "C" fn main() -> i32 {
         flush_callback: alloc::boxed::Box::new(|d: &mut Why2025BadgeWindow| {
             d.flush();
         }),
+        color_theme: ColorTheme::default(),
         font_regular: embedded_graphics_unicodefonts::MONO_9X15,
         font_bold: Some(embedded_graphics_unicodefonts::MONO_9X15_BOLD),
         font_italic: None,
