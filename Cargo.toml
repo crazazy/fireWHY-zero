@@ -1,33 +1,4 @@
-[package]
-name = "fire-why"
-version = "1.0.0"
-edition = "2024"
-authors = ["Zebreus"]
-description = "A starter template for the Why2025 badge Rust app"
-license = "AGPL-3.0"
-repository = "https://github.com/zebreus/why2025-rust-starter"
-keywords = ["why2025", "badge"]
-categories = ["embedded", "no-std", "os"]
+[workspace]
+resolver = "3"
+members = ["firewhy-hal", "fire-why"]
 
-[package.metadata.badgehub]
-name = "rust_starter"
-
-[profile.release]
-panic = 'abort'
-lto = "fat"
-[profile.dev]
-panic = 'abort'
-lto = "thin"
-
-[dependencies]
-why2025-badge-sys = "0.2.0"
-why2025-badge-embedded-graphics = "0.2.0"
-embedded-graphics = "0.8.2"
-mousefood = { version = "0.3", default-features = false, features = [
-    "fonts",
-] }
-ratatui-core = { version = "0.1.0-alpha.6", features = ["underline-color"] }
-embedded-graphics-unicodefonts = "0.2.0"
-ratatui = { version = "0.30.2", default-features = false }
-spin = "0.10.0"
-talc = "4.4.2"
