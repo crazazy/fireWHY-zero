@@ -1,0 +1,410 @@
+use crate::errors::*;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::fmt::Display;
+use core::ops::*;
+use firefly_types::spi::SendStatus;
+
+pub const SAMPLE_RATE: u32 = 44_100;
+
+/// A moment in time. Obtained from [`Device::now`].
+#[derive(Copy, Clone)]
+pub struct Instant {
+    /// Microseconds passed since the device was restarted.
+    pub(crate) us: u32,
+}
+
+impl Instant {
+    pub fn us(self) -> u32 {
+        self.us
+    }
+}
+
+impl Sub for Instant {
+    type Output = Duration;
+
+    fn sub(self, rhs: Self) -> Duration {
+        Duration {
+            us: self.us.saturating_sub(rhs.us),
+        }
+    }
+}
+
+impl Add<Duration> for Instant {
+    type Output = Instant;
+
+    fn add(self, rhs: Duration) -> Self::Output {
+        Self {
+            us: self.us + rhs.us,
+        }
+    }
+}
+
+/// Difference between two [Instant]'s.
+///
+/// Obtained from [`Instant::sub`]. Used by [`Device::delay`].
+#[derive(PartialEq, PartialOrd, Copy, Clone)]
+pub struct Duration {
+    pub(crate) us: u32,
+}
+
+impl Duration {
+    /// Given the desired frames per second, get the duration of a single frame.
+    pub const fn from_fps(fps: u32) -> Self {
+        Self {
+            us: 1_000_000 / fps,
+        }
+    }
+
+    pub const fn from_s(s: u32) -> Self {
+        Self { us: s * 1_000_000 }
+    }
+
+    pub const fn from_ms(ms: u32) -> Self {
+        Self { us: ms * 1000 }
+    }
+
+    pub const fn from_us(us: u32) -> Self {
+        Self { us }
+    }
+
+    pub const fn s(&self) -> u32 {
+        self.us / 1_000_000
+    }
+
+    pub const fn ms(&self) -> u32 {
+        self.us / 1000
+    }
+
+    pub const fn us(&self) -> u32 {
+        self.us
+    }
+
+    pub const fn ns(&self) -> u32 {
+        self.us.saturating_mul(1000)
+    }
+}
+
+impl Sub for Duration {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            us: self.us - rhs.us,
+        }
+    }
+}
+
+impl AddAssign for Duration {
+    fn add_assign(&mut self, rhs: Self) {
+        self.us = self.us.saturating_add(rhs.us)
+    }
+}
+
+impl SubAssign for Duration {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.us = self.us.saturating_sub(rhs.us)
+    }
+}
+
+pub trait Device: Network + Serial + Wifi {
+    type Dir: Dir;
+
+    /// The current time.
+    ///
+    /// Should be precise enough for adjusting the delay between frames.
+    ///
+    /// Usually implemented as [rtic_time.Monotonic].
+    /// May also sometimes be implemented as [rtic_monotonic.Monotonic].
+    ///
+    /// [rtic_time.Monotonic]: https://docs.rs/rtic-time/latest/rtic_time/trait.Monotonic.html
+    /// [rtic_monotonic.Monotonic]: https://docs.rs/rtic-monotonic/latest/rtic_monotonic/trait.Monotonic.html
+    fn now(&self) -> Instant;
+
+    /// Suspends the current thread for the given duration.
+    ///
+    /// Should be precise enough for adjusting the delay between frames.
+    ///
+    /// Usually implemented as [embedded_hal.DelayNs].
+    ///
+    /// [embedded_hal.DelayNs]: https://docs.rs/embedded-hal/1.0.0/embedded_hal/delay/trait.DelayNs.html
+    fn delay(&self, d: Duration);
+
+    /// Read gamepad input.
+    fn read_input(&mut self) -> Option<InputState>;
+
+    /// Get device name override.
+    ///
+    /// Used by emulator in multiplayer to give different names
+    /// to multiple emulators running on the save vfs.
+    fn get_name(&mut self) -> Option<&'static str>;
+
+    /// Log a debug message into console.
+    ///
+    /// On hosted environments, it just prints into stdout.
+    /// On embedded systems, use [defmt].
+    ///
+    /// [defmt]: https://defmt.ferrous-systems.com/introduction
+    fn log_debug<D: Display>(&mut self, src: &str, msg: D);
+
+    /// Log an error into console.
+    ///
+    /// On hosted environments, it just prints into stderr.
+    /// On embedded systems, use [defmt].
+    ///
+    /// [defmt]: https://defmt.ferrous-systems.com/introduction
+    fn log_error<D: Display>(&mut self, src: &str, msg: D);
+
+    /// Get a random number.
+    fn random(&mut self) -> u32;
+
+    fn open_dir(&mut self, path: &[&str]) -> Result<Self::Dir, FSError>;
+
+    /// Returns true if headphones are connected.
+    fn has_headphones(&mut self) -> bool;
+
+    /// Get a writable slice of free audio buffer region.
+    fn get_audio_buffer(&mut self) -> &mut [i16];
+
+    fn get_battery_status(&mut self) -> Option<BatteryStatus>;
+
+    fn write_main_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), &'static str>;
+    fn write_io_flash(&mut self, offset: u32, data: &[u8]) -> NetworkResult<()>;
+    fn switch_main_partition(&mut self, part: u8) -> Result<(), &'static str>;
+    fn switch_io_partition(&mut self, part: u8) -> NetworkResult<()>;
+}
+
+pub(crate) type NetworkResult<T> = Result<T, NetworkError>;
+
+pub trait Network {
+    /// The type representing the network address. Must be unique.
+    ///
+    /// For emulator, it is IP+port. For the physical device, it is MAC address.
+    type Addr: Ord;
+
+    /// Start accepting incoming network connections from other peers.
+    fn net_start(&mut self) -> NetworkResult<()>;
+
+    /// Stop accepting incoming network connections from other peers.
+    fn net_stop(&mut self) -> NetworkResult<()>;
+
+    /// Network address of the current device as visible to the other peers.
+    ///
+    /// Used to sort all the peers, including the local one, in the same order
+    /// on all devices.
+    fn net_local_addr(&self) -> Self::Addr;
+
+    /// Broadcast device presence to all other devices nearby.
+    fn net_advertise(&mut self) -> NetworkResult<()>;
+
+    /// Get a pending message, if any. Non-blocking.
+    #[expect(clippy::type_complexity)]
+    fn net_recv(&mut self) -> NetworkResult<Option<(Self::Addr, Box<[u8]>)>>;
+
+    /// Send a raw message to the given device. Non-blocking.
+    fn net_send(&mut self, addr: Self::Addr, data: &[u8]) -> NetworkResult<()>;
+
+    /// Send a raw message to the given device. Non-blocking.
+    fn net_send_status(&mut self, addr: Self::Addr) -> NetworkResult<SendStatus>;
+}
+
+pub trait Wifi {
+    fn wifi_scan(&mut self) -> NetworkResult<[String; 6]>;
+    fn wifi_connect(&mut self, ssid: &str, pass: &str) -> NetworkResult<()>;
+    fn wifi_status(&mut self) -> NetworkResult<u8>;
+    fn wifi_disconnect(&mut self) -> NetworkResult<()>;
+    fn tcp_connect(&mut self, ip: u32, port: u16) -> NetworkResult<()>;
+    fn tcp_status(&mut self) -> NetworkResult<u8>;
+    fn tcp_send(&mut self, data: &[u8]) -> NetworkResult<()>;
+    fn tcp_recv(&mut self) -> NetworkResult<Box<[u8]>>;
+    fn tcp_close(&mut self) -> NetworkResult<()>;
+}
+
+pub trait Dir {
+    type Read: embedded_io::Read + embedded_io::Seek;
+    type Write: embedded_io::Write;
+
+    /// Open a file for reading.
+    ///
+    /// The file path is given as a slice of path components.
+    /// There are at least 4 components:
+    ///
+    /// 1. the first one is the root directory (either "roms" or "data"),
+    /// 2. the second is the author ID,
+    /// 3. the third is the app ID,
+    /// 4. (optional) directory names if the file is nested,
+    /// 5. and the last is file name.
+    ///
+    /// The runtime ensures that the path is relative and never goes up the tree.
+    ///
+    /// The whole filesystem abstraction (this method and the ones below)
+    /// is designed to work nicely with [embedded_sdmmc] and the stdlib filesystem.
+    ///
+    /// [embedded_sdmmc]: https://github.com/rust-embedded-community/embedded-sdmmc-rs
+    fn open_file(&mut self, name: &str) -> Result<Self::Read, FSError>;
+
+    /// Create a new file and open it for write.
+    ///
+    /// If the file already exists, it will be overwritten.
+    fn create_file(&mut self, name: &str) -> Result<Self::Write, FSError>;
+
+    /// Write data to the end of the file.
+    fn append_file(&mut self, name: &str) -> Result<Self::Write, FSError>;
+
+    /// Get file size in bytes.
+    ///
+    /// None should be returned if file not found.
+    fn get_file_size(&mut self, name: &str) -> Result<u32, FSError>;
+
+    /// Delete the given file if exists.
+    ///
+    /// Returns false only if there is an error.
+    fn remove_file(&mut self, name: &str) -> Result<(), FSError>;
+
+    /// Create a new empty sub-directory.
+    ///
+    /// Returns `DirAlreadyExists` if directory already exists.
+    fn create_dir(&mut self, name: &str) -> Result<(), FSError>;
+
+    /// Remove the directory and all its contents.
+    fn remove_dir(self) -> Result<(), FSError>;
+
+    /// Call the callback for each entry in the given directory.
+    ///
+    /// A better API would be to return an iterator
+    /// but embedded-sdmmc-rs [doesn't support it][1].
+    ///
+    /// [1]: https://github.com/rust-embedded-community/embedded-sdmmc-rs/issues/125
+    fn iter_dir<F>(&mut self, f: F) -> Result<(), FSError>
+    where
+        F: FnMut(EntryKind, &[u8]);
+}
+
+/// Access the USB serial port.
+pub trait Serial {
+    fn serial_start(&mut self) -> NetworkResult<()>;
+    fn serial_stop(&mut self) -> NetworkResult<()>;
+    fn serial_recv(&mut self) -> NetworkResult<Option<Box<[u8]>>>;
+    fn serial_send(&mut self, data: &[u8]) -> NetworkResult<()>;
+}
+
+#[derive(PartialEq, Copy, Clone)]
+pub enum EntryKind {
+    Dir,
+    File,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct Pad {
+    pub x: i16,
+    pub y: i16,
+}
+
+impl From<(i16, i16)> for Pad {
+    fn from(value: (i16, i16)) -> Self {
+        Self {
+            x: value.0,
+            y: value.1,
+        }
+    }
+}
+
+impl From<Pad> for (i16, i16) {
+    fn from(value: Pad) -> Self {
+        (value.x, value.y)
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct InputState {
+    pub pad: Option<Pad>,
+    pub buttons: u8,
+}
+
+impl InputState {
+    pub fn s(&self) -> bool {
+        self.buttons & 0b1 > 0
+    }
+
+    pub fn e(&self) -> bool {
+        self.buttons & 0b10 > 0
+    }
+
+    pub fn w(&self) -> bool {
+        self.buttons & 0b100 > 0
+    }
+
+    pub fn n(&self) -> bool {
+        self.buttons & 0b1000 > 0
+    }
+
+    pub fn menu(&self) -> bool {
+        self.buttons & 0b10000 > 0
+    }
+
+    pub fn rotate(&mut self) {
+        if let Some(pad) = self.pad.as_mut() {
+            pad.x = -pad.x;
+            pad.y = -pad.y;
+        };
+        let mut btns = u8::from(self.menu());
+        btns = (btns << 1) | u8::from(self.s());
+        btns = (btns << 1) | u8::from(self.e());
+        btns = (btns << 1) | u8::from(self.w());
+        btns = (btns << 1) | u8::from(self.n());
+        self.buttons = btns;
+    }
+
+    #[must_use]
+    pub fn merge(&self, other: &Self) -> Self {
+        Self {
+            pad: match &self.pad {
+                Some(pad) => Some(pad.clone()),
+                None => other.pad.clone(),
+            },
+            buttons: self.buttons | other.buttons,
+        }
+    }
+}
+
+/// The battery status info.
+///
+/// Contains only stats that can be accessed from the hardware.
+/// It's responsibility of firefly-runtime to calculate State of Charge
+/// and any other metrics it might need.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub struct BatteryStatus {
+    /// The current voltage of the battery.
+    ///
+    /// A healthy li-ion battery voltage ranges from 3.0V fully discharged
+    /// to 4.2V fully charged at 25°C. However, the range changes with age,
+    /// temperature, and star alignment (the last one is a joke, probably).
+    ///
+    /// Also, the firefly-hal Device implementation doesn't define the units
+    /// in which voltage is returned. it can be volts, microvolts, or anything
+    /// else. The only promise is that it linearly correlates with voltage.
+    pub voltage: u16,
+
+    /// If true, the device is connected to a charger.
+    ///
+    /// It indicates that the battery is charging, unless it's full.
+    pub connected: bool,
+
+    /// If true, the device is fully charged.
+    pub full: bool,
+}
+
+// (func (param $originalPtr i32)
+//   (param $originalSize i32)
+//   (param $alignment i32)
+//   (param $newSize i32)
+//   (result i32))
+
+// sample rate
+// channels
+
+// volume
+// speed
+// play/pause
+// stop
+// play_next
